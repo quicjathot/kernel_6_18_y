@@ -3,6 +3,7 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
+#include <linux/crc8.h>
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
@@ -13,27 +14,26 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/sizes.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include <drm/drm_bridge.h>
+
 #define FW_FILE "lt8713sx_fw.bin"
 
-#define LT8713SX_PAGE_SIZE 256
-#define FW_12K_SIZE        (12  * 1024)
-#define FW_64K_SIZE        (64  * 1024)
-#define FW_256K_SIZE       (256 * 1024)
+#define REG_PAGE_CONTROL	0xff
 
-struct crc_config {
-	u8 width;
-	u32 poly;
-	u32 crc_init;
-	u32 xor_out;
-	bool ref_in;
-	bool ref_out;
-};
+#define MAX_OUTPUT_PORTS	3
+#define LT8713SX_PAGE_SIZE	256
+
+DECLARE_CRC8_TABLE(lt8713sx_crc_table);
 
 struct lt8713sx {
 	struct device *dev;
+	struct drm_bridge bridge;
+	struct drm_bridge *next_bridge[MAX_OUTPUT_PORTS];
+	int num_outputs;
 
 	struct regmap *regmap;
 	/* Protects all accesses to registers by stopping the on-chip MCU */
@@ -41,8 +41,6 @@ struct lt8713sx {
 
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *enable_gpio;
-
-	struct regulator_bulk_data supplies[2];
 
 	struct i2c_client *client;
 	const struct firmware *fw;
@@ -59,7 +57,7 @@ static void lt8713sx_reset(struct lt8713sx *lt8713sx);
 
 static const struct regmap_range lt8713sx_ranges[] = {
 	{
-		.range_min = 0,
+		.range_min = 0x0000,
 		.range_max = 0xffff
 	},
 };
@@ -69,178 +67,110 @@ static const struct regmap_access_table lt8713sx_table = {
 	.n_yes_ranges = ARRAY_SIZE(lt8713sx_ranges),
 };
 
+static const struct regmap_range_cfg lt8713sx_range_cfg = {
+	.name = "lt8713sx",
+	.range_min = 0x0000,
+	.range_max = 0xffff,
+	.selector_reg = REG_PAGE_CONTROL,
+	.selector_mask = 0xff,
+	.selector_shift = 0,
+	.window_start = 0,
+	.window_len = 0x100,
+};
+
 static const struct regmap_config lt8713sx_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 8,
 	.volatile_table = &lt8713sx_table,
+	.ranges = &lt8713sx_range_cfg,
+	.num_ranges = 1,
 	.cache_type = REGCACHE_NONE,
+	.max_register = 0xffff,
 };
 
 static void lt8713sx_i2c_enable(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0xff, 0xe0);
-	regmap_write(lt8713sx->regmap, 0xee, 0x01);
+	regmap_write(lt8713sx->regmap, 0xe0ee, 0x01);
 }
 
 static void lt8713sx_i2c_disable(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0xff, 0xe0);
-	regmap_write(lt8713sx->regmap, 0xee, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe0ee, 0x00);
 }
 
-static unsigned int bits_reverse(u32 in_val, u8 bits)
+static u32 calculate_crc(const u8 *upgrade_data, u64 len, u64 crc_size)
 {
-	u32 out_val = 0;
-	u8 i;
+	u8 crc = 0x00;
+	u8 pad = 0xff;
 
-	for (i = 0; i < bits; i++) {
-		if (in_val & (1 << i))
-			out_val |= 1 << (bits - 1 - i);
-	}
+	crc = crc8(lt8713sx_crc_table, upgrade_data, len, crc);
 
-	return out_val;
-}
-
-static unsigned int get_crc(struct crc_config crc_cfg, const  u8 *buf, u64 buf_len)
-{
-	u8 width    = crc_cfg.width;
-	u32  poly   = crc_cfg.poly;
-	u32  crc    = crc_cfg.crc_init;
-	u32  xorout = crc_cfg.xor_out;
-	bool refin  = crc_cfg.ref_in;
-	bool refout = crc_cfg.ref_out;
-	u8 n;
-	u32  bits;
-	u32  data;
-	u8 i;
-
-	n    =  (width < 8) ? 0 : (width - 8);
-	crc  =  (width < 8) ? (crc << (8 - width)) : crc;
-	bits =  (width < 8) ? 0x80 : (1 << (width - 1));
-	poly =  (width < 8) ? (poly << (8 - width)) : poly;
-
-	while (buf_len--) {
-		data = *(buf++);
-		if (refin)
-			data = bits_reverse(data, 8);
-		crc ^= (data << n);
-		for (i = 0; i < 8; i++) {
-			if (crc & bits)
-				crc = (crc << 1) ^ poly;
-			else
-				crc = crc << 1;
-		}
-	}
-	crc = (width < 8) ? (crc >> (8 - width)) : crc;
-	if (refout)
-		crc = bits_reverse(crc, width);
-	crc ^= xorout;
-
-	return (crc & ((2 << (width - 1)) - 1));
-}
-
-static u32 calculate_64K_crc(const u8 *upgrade_data, u64 len)
-{
-	struct crc_config crc_cfg = {
-		.width = 8,
-		.poly  = 0x31,
-		.crc_init = 0,
-		.xor_out = 0,
-		.ref_out = false,
-		.ref_in = false,
-	};
-	u64 crc_size = FW_64K_SIZE - 1;
-	u8 default_val = 0xFF;
-
-	crc_cfg.crc_init = get_crc(crc_cfg, upgrade_data, len);
-
+	/* pad remaining bytes */
 	crc_size -= len;
 	while (crc_size--)
-		crc_cfg.crc_init = get_crc(crc_cfg, &default_val, 1);
+		crc = crc8(lt8713sx_crc_table, &pad, 1, crc);
 
-	return crc_cfg.crc_init;
-}
-
-static u32 calculate_12K_crc(const u8 *upgrade_data, u64 len)
-{
-	struct crc_config crc_cfg = {
-		.width = 8,
-		.poly  = 0x31,
-		.crc_init = 0,
-		.xor_out = 0,
-		.ref_out = false,
-		.ref_in = false,
-	};
-	u64 crc_size = FW_12K_SIZE;
-	u8 default_val = 0xFF;
-
-	crc_cfg.crc_init = get_crc(crc_cfg, upgrade_data, len);
-
-	crc_size -= len;
-	while (crc_size--)
-		crc_cfg.crc_init = get_crc(crc_cfg, &default_val, 1);
-
-	return crc_cfg.crc_init;
+	return crc;
 }
 
 static int lt8713sx_prepare_firmware_data(struct lt8713sx *lt8713sx)
 {
 	int ret = 0;
+	u64 sz_12k = 12 * SZ_1K;
 
 	ret = request_firmware(&lt8713sx->fw, FW_FILE, lt8713sx->dev);
 	if (ret < 0) {
-		pr_err("request firmware failed\n");
+		dev_err(lt8713sx->dev, "request firmware failed\n");
 		return ret;
 	}
 
-	pr_debug("Firmware size: %zu bytes\n", lt8713sx->fw->size);
+	dev_dbg(lt8713sx->dev, "Firmware size: %zu bytes\n", lt8713sx->fw->size);
 
-	if (lt8713sx->fw->size > FW_256K_SIZE - 1) {
-		pr_err("Firmware size exceeds 256KB limit\n");
+	if (lt8713sx->fw->size > SZ_256K - 1) {
+		dev_err(lt8713sx->dev, "Firmware size exceeds 256KB limit\n");
 		release_firmware(lt8713sx->fw);
 		return -EINVAL;
 	}
 
-	lt8713sx->fw_buffer = kzalloc(FW_256K_SIZE, GFP_KERNEL);
+	lt8713sx->fw_buffer = kvmalloc(SZ_256K, GFP_KERNEL);
 	if (!lt8713sx->fw_buffer) {
 		release_firmware(lt8713sx->fw);
 		return -ENOMEM;
 	}
 
-	memset(lt8713sx->fw_buffer, 0xFF, FW_256K_SIZE);
+	memset(lt8713sx->fw_buffer, 0xff, SZ_256K);
 
-	if (lt8713sx->fw->size < FW_64K_SIZE) {
-		/*TODO: CRC should be calculated with 0xff also */
+	if (lt8713sx->fw->size < SZ_64K) {
 		memcpy(lt8713sx->fw_buffer, lt8713sx->fw->data, lt8713sx->fw->size);
-		lt8713sx->fw_buffer[FW_64K_SIZE - 1] =
-				calculate_64K_crc(lt8713sx->fw->data, lt8713sx->fw->size);
-		lt8713sx->main_crc_value = lt8713sx->fw_buffer[FW_64K_SIZE - 1];
-		pr_debug("Main Firmware Data  Crc=0x%02X\n", lt8713sx->main_crc_value);
+		lt8713sx->fw_buffer[SZ_64K - 1] =
+				calculate_crc(lt8713sx->fw->data, lt8713sx->fw->size, SZ_64K - 1);
+		lt8713sx->main_crc_value = lt8713sx->fw_buffer[SZ_64K - 1];
+		dev_dbg(lt8713sx->dev,
+			"Main Firmware Data  Crc=0x%02X\n", lt8713sx->main_crc_value);
 
 	} else {
-		//main firmware
-		memcpy(lt8713sx->fw_buffer, lt8713sx->fw->data, FW_64K_SIZE - 1);
-		lt8713sx->fw_buffer[FW_64K_SIZE - 1] =
-				calculate_64K_crc(lt8713sx->fw_buffer, FW_64K_SIZE - 1);
-		lt8713sx->main_crc_value = lt8713sx->fw_buffer[FW_64K_SIZE - 1];
-		pr_debug("Main Firmware Data  Crc=0x%02X\n", lt8713sx->main_crc_value);
+		/* main firmware */
+		memcpy(lt8713sx->fw_buffer, lt8713sx->fw->data, SZ_64K - 1);
+		lt8713sx->fw_buffer[SZ_64K - 1] =
+				calculate_crc(lt8713sx->fw_buffer, SZ_64K - 1, SZ_64K - 1);
+		lt8713sx->main_crc_value = lt8713sx->fw_buffer[SZ_64K - 1];
+		dev_dbg(lt8713sx->dev,
+			"Main Firmware Data  Crc=0x%02X\n", lt8713sx->main_crc_value);
 
-		//bank firmware
-		memcpy(lt8713sx->fw_buffer + FW_64K_SIZE,
-		       lt8713sx->fw->data + FW_64K_SIZE,
-		       lt8713sx->fw->size - FW_64K_SIZE);
+		/* bank firmware */
+		memcpy(lt8713sx->fw_buffer + SZ_64K,
+		       lt8713sx->fw->data + SZ_64K,
+		       lt8713sx->fw->size - SZ_64K);
 
-		lt8713sx->bank_num = (lt8713sx->fw->size - FW_64K_SIZE + FW_12K_SIZE - 1) /
-					FW_12K_SIZE;
-		pr_debug("Bank Number Total is %d.\n", lt8713sx->bank_num);
+		lt8713sx->bank_num = (lt8713sx->fw->size - SZ_64K + sz_12k - 1) / sz_12k;
+		dev_dbg(lt8713sx->dev, "Bank Number Total is %d.\n", lt8713sx->bank_num);
 
 		for (int i = 0; i < lt8713sx->bank_num; i++) {
 			lt8713sx->bank_crc_value[i] =
-				calculate_12K_crc(lt8713sx->fw_buffer + FW_64K_SIZE +
-						  i * FW_12K_SIZE,
-						  FW_12K_SIZE);
-			pr_debug("Bank number:%d; Firmware Data  Crc:0x%02X\n",
-				 i, lt8713sx->bank_crc_value[i]);
+				calculate_crc(lt8713sx->fw_buffer + SZ_64K + i * sz_12k,
+					      sz_12k, sz_12k);
+			dev_dbg(lt8713sx->dev, "Bank number:%d; Firmware Data  Crc:0x%02X\n",
+				i, lt8713sx->bank_crc_value[i]);
 		}
 	}
 	return 0;
@@ -248,75 +178,68 @@ static int lt8713sx_prepare_firmware_data(struct lt8713sx *lt8713sx)
 
 static void lt8713sx_config_parameters(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0xFF, 0xE0);
-	regmap_write(lt8713sx->regmap, 0xEE, 0x01);
-	regmap_write(lt8713sx->regmap, 0x5E, 0xC1);
-	regmap_write(lt8713sx->regmap, 0x58, 0x00);
-	regmap_write(lt8713sx->regmap, 0x59, 0x50);
-	regmap_write(lt8713sx->regmap, 0x5A, 0x10);
-	regmap_write(lt8713sx->regmap, 0x5A, 0x00);
-	regmap_write(lt8713sx->regmap, 0x58, 0x21);
+	regmap_write(lt8713sx->regmap, 0xe0ee, 0x01);
+	regmap_write(lt8713sx->regmap, 0xe05e, 0xc1);
+	regmap_write(lt8713sx->regmap, 0xe058, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe059, 0x50);
+	regmap_write(lt8713sx->regmap, 0xe05a, 0x10);
+	regmap_write(lt8713sx->regmap, 0xe05a, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe058, 0x21);
 }
 
 static void lt8713sx_wren(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0xff, 0xe1);
-	regmap_write(lt8713sx->regmap, 0x03, 0xbf);
-	regmap_write(lt8713sx->regmap, 0x03, 0xff);
-	regmap_write(lt8713sx->regmap, 0xff, 0xe0);
-	regmap_write(lt8713sx->regmap, 0x5a, 0x04);
-	regmap_write(lt8713sx->regmap, 0x5a, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe103, 0xbf);
+	regmap_write(lt8713sx->regmap, 0xe103, 0xff);
+	regmap_write(lt8713sx->regmap, 0xe05a, 0x04);
+	regmap_write(lt8713sx->regmap, 0xe05a, 0x00);
 }
 
 static void lt8713sx_wrdi(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0x5A, 0x08);
-	regmap_write(lt8713sx->regmap, 0x5A, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe05a, 0x08);
+	regmap_write(lt8713sx->regmap, 0xe05a, 0x00);
 }
 
 static void lt8713sx_fifo_reset(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0xff, 0xe1);
-	regmap_write(lt8713sx->regmap, 0x03, 0xbf);
-	regmap_write(lt8713sx->regmap, 0x03, 0xff);
+	regmap_write(lt8713sx->regmap, 0xe103, 0xbf);
+	regmap_write(lt8713sx->regmap, 0xe103, 0xff);
 }
 
 static void lt8713sx_disable_sram_write(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0xff, 0xe0);
-	regmap_write(lt8713sx->regmap, 0x55, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe055, 0x00);
 }
 
 static void lt8713sx_sram_to_flash(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0x5a, 0x30);
-	regmap_write(lt8713sx->regmap, 0x5a, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe05a, 0x30);
+	regmap_write(lt8713sx->regmap, 0xe05a, 0x00);
 }
 
 static void lt8713sx_i2c_to_sram(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0x55, 0x80);
-	regmap_write(lt8713sx->regmap, 0x5e, 0xc0);
-	regmap_write(lt8713sx->regmap, 0x58, 0x21);
+	regmap_write(lt8713sx->regmap, 0xe055, 0x80);
+	regmap_write(lt8713sx->regmap, 0xe05e, 0xc0);
+	regmap_write(lt8713sx->regmap, 0xe058, 0x21);
 }
 
 static u8 lt8713sx_read_flash_status(struct lt8713sx *lt8713sx)
 {
 	u32 flash_status = 0;
 
-	regmap_write(lt8713sx->regmap,  0xFF, 0xE1);//fifo_rst_n
-	regmap_write(lt8713sx->regmap,  0x03, 0x3F);
-	regmap_write(lt8713sx->regmap,  0x03, 0xFF);
+	regmap_write(lt8713sx->regmap,  0xe103, 0x3f);
+	regmap_write(lt8713sx->regmap,  0xe103, 0xff);
 
-	regmap_write(lt8713sx->regmap,  0xFF, 0xE0);
-	regmap_write(lt8713sx->regmap,  0x5e, 0x40);
-	regmap_write(lt8713sx->regmap,  0x56, 0x05);//opcode=read status register
-	regmap_write(lt8713sx->regmap,  0x55, 0x25);
-	regmap_write(lt8713sx->regmap,  0x55, 0x01);
-	regmap_write(lt8713sx->regmap,  0x58, 0x21);
+	regmap_write(lt8713sx->regmap,  0xe05e, 0x40);
+	regmap_write(lt8713sx->regmap,  0xe056, 0x05); /* opcode=read status register */
+	regmap_write(lt8713sx->regmap,  0xe055, 0x25);
+	regmap_write(lt8713sx->regmap,  0xe055, 0x01);
+	regmap_write(lt8713sx->regmap,  0xe058, 0x21);
 
-	regmap_read(lt8713sx->regmap, 0x5f, &flash_status);
-	pr_debug("flash_status:%x\n", flash_status);
+	regmap_read(lt8713sx->regmap, 0xe05f, &flash_status);
+	dev_dbg(lt8713sx->dev, "flash_status:%x\n", flash_status);
 
 	return flash_status;
 }
@@ -329,20 +252,19 @@ static void lt8713sx_block_erase(struct lt8713sx *lt8713sx)
 	u32 flashaddr = 0x00;
 
 	for (blocknum = 0; blocknum < 8; blocknum++) {
-		flashaddr = blocknum * 0x008000;
-		regmap_write(lt8713sx->regmap,  0xFF, 0xE0);
-		regmap_write(lt8713sx->regmap,  0xEE, 0x01);
-		regmap_write(lt8713sx->regmap,  0x5A, 0x04);
-		regmap_write(lt8713sx->regmap,  0x5A, 0x00);
-		regmap_write(lt8713sx->regmap,  0x5B, flashaddr >> 16);//set flash address[23:16]
-		regmap_write(lt8713sx->regmap,  0x5C, flashaddr >> 8);//set flash address[15:8]
-		regmap_write(lt8713sx->regmap,  0x5D, flashaddr);//set flash address[7:0]
-		regmap_write(lt8713sx->regmap,  0x5A, 0x01);
-		regmap_write(lt8713sx->regmap,  0x5A, 0x00);
-		msleep(100); //delay 100ms
+		flashaddr = blocknum * SZ_32K;
+		regmap_write(lt8713sx->regmap,  0xe0ee, 0x01);
+		regmap_write(lt8713sx->regmap,  0xe05a, 0x04);
+		regmap_write(lt8713sx->regmap,  0xe05a, 0x00);
+		regmap_write(lt8713sx->regmap,  0xe05b, flashaddr >> 16);
+		regmap_write(lt8713sx->regmap,  0xe05c, flashaddr >> 8);
+		regmap_write(lt8713sx->regmap,  0xe05d, flashaddr);
+		regmap_write(lt8713sx->regmap,  0xe05a, 0x01);
+		regmap_write(lt8713sx->regmap,  0xe05a, 0x00);
+		msleep(100);
 		i = 0;
 		while (1) {
-			flash_status = lt8713sx_read_flash_status(lt8713sx); //wait erase finish
+			flash_status = lt8713sx_read_flash_status(lt8713sx);
 			if ((flash_status & 0x01) == 0)
 				break;
 
@@ -350,44 +272,42 @@ static void lt8713sx_block_erase(struct lt8713sx *lt8713sx)
 				break;
 
 			i++;
-			msleep(50); //delay 50ms
+			msleep(50);
 		}
 	}
-	pr_debug("erase flash done.\n");
+	dev_dbg(lt8713sx->dev, "erase flash done.\n");
 }
 
 static void lt8713sx_load_main_fw_to_sram(struct lt8713sx *lt8713sx)
 {
-	regmap_write(lt8713sx->regmap, 0xff, 0xe0);
-	regmap_write(lt8713sx->regmap, 0xee, 0x01);
-	regmap_write(lt8713sx->regmap, 0x68, 0x00);
-	regmap_write(lt8713sx->regmap, 0x69, 0x00);
-	regmap_write(lt8713sx->regmap, 0x6a, 0x00);
-	regmap_write(lt8713sx->regmap, 0x65, 0x00);
-	regmap_write(lt8713sx->regmap, 0x66, 0xff);
-	regmap_write(lt8713sx->regmap, 0x67, 0xff);
-	regmap_write(lt8713sx->regmap, 0x6b, 0x00);
-	regmap_write(lt8713sx->regmap, 0x6c, 0x00);
-	regmap_write(lt8713sx->regmap, 0x60, 0x01);
+	regmap_write(lt8713sx->regmap, 0xe0ee, 0x01);
+	regmap_write(lt8713sx->regmap, 0xe068, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe069, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe06a, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe065, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe066, 0xff);
+	regmap_write(lt8713sx->regmap, 0xe067, 0xff);
+	regmap_write(lt8713sx->regmap, 0xe06b, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe06c, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe060, 0x01);
 	msleep(200);
-	regmap_write(lt8713sx->regmap, 0x60, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe060, 0x00);
 }
 
 static void lt8713sx_load_bank_fw_to_sram(struct lt8713sx *lt8713sx, u64 addr)
 {
-	regmap_write(lt8713sx->regmap, 0xff, 0xe0);
-	regmap_write(lt8713sx->regmap, 0xee, 0x01);
-	regmap_write(lt8713sx->regmap, 0x68, ((addr & 0xFF0000) >> 16));
-	regmap_write(lt8713sx->regmap, 0x69, ((addr & 0x00FF00) >> 8));
-	regmap_write(lt8713sx->regmap, 0x6a, (addr & 0x0000FF));
-	regmap_write(lt8713sx->regmap, 0x65, 0x00);
-	regmap_write(lt8713sx->regmap, 0x66, 0x30);
-	regmap_write(lt8713sx->regmap, 0x67, 0x00);
-	regmap_write(lt8713sx->regmap, 0x6b, 0x00);
-	regmap_write(lt8713sx->regmap, 0x6c, 0x00);
-	regmap_write(lt8713sx->regmap, 0x60, 0x01);
+	regmap_write(lt8713sx->regmap, 0xe0ee, 0x01);
+	regmap_write(lt8713sx->regmap, 0xe068, ((addr & 0xff0000) >> 16));
+	regmap_write(lt8713sx->regmap, 0xe069, ((addr & 0x00ff00) >> 8));
+	regmap_write(lt8713sx->regmap, 0xe06a, (addr & 0x0000ff));
+	regmap_write(lt8713sx->regmap, 0xe065, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe066, 0x30);
+	regmap_write(lt8713sx->regmap, 0xe067, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe06b, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe06c, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe060, 0x01);
 	msleep(50);
-	regmap_write(lt8713sx->regmap, 0x60, 0x00);
+	regmap_write(lt8713sx->regmap, 0xe060, 0x00);
 }
 
 static int lt8713sx_write_data(struct lt8713sx *lt8713sx, const u8 *data, u64 filesize)
@@ -397,18 +317,19 @@ static int lt8713sx_write_data(struct lt8713sx *lt8713sx, const u8 *data, u64 fi
 	page = (filesize % LT8713SX_PAGE_SIZE) ?
 			((filesize / LT8713SX_PAGE_SIZE) + 1) : (filesize / LT8713SX_PAGE_SIZE);
 
-	pr_debug("Writing to Sram=%u pages, total size = %llu bytes\n", page, filesize);
+	dev_dbg(lt8713sx->dev,
+		"Writing to Sram=%u pages, total size = %llu bytes\n", page, filesize);
 
 	for (num = 0; num < page; num++) {
-		pr_debug("page[%d]\n", num);
+		dev_dbg(lt8713sx->dev, "page[%d]\n", num);
 		lt8713sx_i2c_to_sram(lt8713sx);
 
 		for (i = 0; i < LT8713SX_PAGE_SIZE; i++) {
 			if ((num * LT8713SX_PAGE_SIZE + i) < filesize)
 				val = *(data + (num * LT8713SX_PAGE_SIZE + i));
 			else
-				val = 0xFF;
-			regmap_write(lt8713sx->regmap, 0x59, val);
+				val = 0xff;
+			regmap_write(lt8713sx->regmap, 0xe059, val);
 		}
 
 		lt8713sx_wren(lt8713sx);
@@ -425,32 +346,29 @@ static void lt8713sx_main_upgrade_result(struct lt8713sx *lt8713sx)
 {
 	u32 main_crc_result;
 
-	regmap_write(lt8713sx->regmap, 0xff, 0xe0);
-	regmap_read(lt8713sx->regmap, 0x23, &main_crc_result);
+	regmap_read(lt8713sx->regmap, 0xe023, &main_crc_result);
 
-	pr_debug("Main CRC HW: 0x%02X\n", main_crc_result);
-	pr_debug("Main CRC FW: 0x%02X\n", lt8713sx->main_crc_value);
+	dev_dbg(lt8713sx->dev, "Main CRC HW: 0x%02X\n", main_crc_result);
+	dev_dbg(lt8713sx->dev, "Main CRC FW: 0x%02X\n", lt8713sx->main_crc_value);
 
 	if (main_crc_result == lt8713sx->main_crc_value)
-		pr_debug("Main Firmware Upgrade Success.\n");
+		dev_dbg(lt8713sx->dev, "Main Firmware Upgrade Success.\n");
 	else
-		pr_err("Main Firmware Upgrade Failed.\n");
+		dev_err(lt8713sx->dev, "Main Firmware Upgrade Failed.\n");
 }
 
 static void lt8713sx_bank_upgrade_result(struct lt8713sx *lt8713sx, u8 banknum)
 {
 	u32 bank_crc_result;
 
-	regmap_write(lt8713sx->regmap, 0xff, 0xe0);
+	regmap_read(lt8713sx->regmap, 0xe023, &bank_crc_result);
 
-	regmap_read(lt8713sx->regmap, 0x23, &bank_crc_result);
-
-	pr_debug("Bank %d CRC Result: 0x%02X\n", banknum, bank_crc_result);
+	dev_dbg(lt8713sx->dev, "Bank %d CRC Result: 0x%02X\n", banknum, bank_crc_result);
 
 	if (bank_crc_result == lt8713sx->bank_crc_value[banknum])
-		pr_debug("Bank %d Firmware Upgrade Success.\n", banknum);
+		dev_dbg(lt8713sx->dev, "Bank %d Firmware Upgrade Success.\n", banknum);
 	else
-		pr_err("Bank %d Firmware Upgrade Failed.\n", banknum);
+		dev_err(lt8713sx->dev, "Bank %d Firmware Upgrade Failed.\n", banknum);
 }
 
 static void lt8713sx_bank_result_check(struct lt8713sx *lt8713sx)
@@ -473,21 +391,20 @@ static int lt8713sx_firmware_upgrade(struct lt8713sx *lt8713sx)
 
 	lt8713sx_block_erase(lt8713sx);
 
-	if (lt8713sx->fw->size < FW_64K_SIZE) {
-		ret = lt8713sx_write_data(lt8713sx, lt8713sx->fw_buffer, FW_64K_SIZE);
+	if (lt8713sx->fw->size < SZ_64K) {
+		ret = lt8713sx_write_data(lt8713sx, lt8713sx->fw_buffer, SZ_64K);
 		if (ret < 0) {
-			pr_err("Failed to write firmware data: %d\n", ret);
+			dev_err(lt8713sx->dev, "Failed to write firmware data: %d\n", ret);
 			return ret;
 		}
 	} else {
 		ret = lt8713sx_write_data(lt8713sx, lt8713sx->fw_buffer, lt8713sx->fw->size);
 		if (ret < 0) {
-			pr_err("Failed to write firmware data: %d\n", ret);
+			dev_err(lt8713sx->dev, "Failed to write firmware data: %d\n", ret);
 			return ret;
 		}
 	}
-
-	pr_debug("Write Data done.\n");
+	dev_dbg(lt8713sx->dev, "Write Data done.\n");
 
 	return 0;
 }
@@ -501,13 +418,13 @@ static int lt8713sx_firmware_update(struct lt8713sx *lt8713sx)
 
 	ret = lt8713sx_prepare_firmware_data(lt8713sx);
 	if (ret < 0) {
-		pr_err("Failed to prepare firmware data: %d\n", ret);
+		dev_err(lt8713sx->dev, "Failed to prepare firmware data: %d\n", ret);
 		goto error;
 	}
 
 	ret = lt8713sx_firmware_upgrade(lt8713sx);
 	if (ret < 0) {
-		pr_err("Upgrade failure.\n");
+		dev_err(lt8713sx->dev, "Upgrade failure.\n");
 		goto error;
 	} else {
 		/* Validate CRC */
@@ -524,7 +441,7 @@ error:
 	if (!ret)
 		lt8713sx_reset(lt8713sx);
 
-	kfree(lt8713sx->fw_buffer);
+	kvfree(lt8713sx->fw_buffer);
 	lt8713sx->fw_buffer = NULL;
 
 	if (lt8713sx->fw) {
@@ -538,53 +455,97 @@ error:
 
 static void lt8713sx_reset(struct lt8713sx *lt8713sx)
 {
-	pr_debug("reset bridge.\n");
+	dev_dbg(lt8713sx->dev, "reset bridge.\n");
 	gpiod_set_value_cansleep(lt8713sx->reset_gpio, 1);
 	msleep(20);
 
 	gpiod_set_value_cansleep(lt8713sx->reset_gpio, 0);
 	msleep(20);
 
-	gpiod_set_value_cansleep(lt8713sx->reset_gpio, 1);
-	msleep(20);
-	pr_debug("reset done.\n");
-}
-
-static int lt8713sx_regulator_init(struct lt8713sx *lt8713sx)
-{
-	int ret;
-
-	lt8713sx->supplies[0].supply = "vdd";
-	lt8713sx->supplies[1].supply = "vcc";
-
-	ret = devm_regulator_bulk_get(lt8713sx->dev, 2, lt8713sx->supplies);
-	if (ret < 0)
-		return dev_err_probe(lt8713sx->dev, ret, "failed to get regulators\n");
-
-	ret = regulator_set_load(lt8713sx->supplies[0].consumer, 200000);
-	if (ret < 0)
-		return dev_err_probe(lt8713sx->dev, ret, "failed to set regulator load\n");
-
-	return 0;
+	dev_dbg(lt8713sx->dev, "reset done.\n");
 }
 
 static int lt8713sx_regulator_enable(struct lt8713sx *lt8713sx)
 {
 	int ret;
 
-	ret = regulator_enable(lt8713sx->supplies[0].consumer);
+	ret = devm_regulator_get_enable(lt8713sx->dev, "vdd");
 	if (ret < 0)
 		return dev_err_probe(lt8713sx->dev, ret, "failed to enable vdd regulator\n");
 
 	usleep_range(1000, 10000);
 
-	ret = regulator_enable(lt8713sx->supplies[1].consumer);
-	if (ret < 0) {
-		regulator_disable(lt8713sx->supplies[0].consumer);
+	ret = devm_regulator_get_enable(lt8713sx->dev, "vcc");
+	if (ret < 0)
 		return dev_err_probe(lt8713sx->dev, ret, "failed to enable vcc regulator\n");
-	}
 	return 0;
 }
+
+static int lt8713sx_bridge_attach(struct drm_bridge *bridge,
+				  struct drm_encoder *encoder,
+				  enum drm_bridge_attach_flags flags)
+{
+	struct lt8713sx *lt8713sx = container_of(bridge, struct lt8713sx, bridge);
+	int i, ret;
+
+	for (i = 0; i < lt8713sx->num_outputs; i++) {
+		if (!lt8713sx->next_bridge[i])
+			continue;
+
+		ret = drm_bridge_attach(encoder,
+					lt8713sx->next_bridge[i],
+					bridge, flags);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int lt8713sx_get_ports(struct lt8713sx *lt8713sx)
+{
+	struct device *dev = lt8713sx->dev;
+	struct device_node *port, *ports, *ep, *remote;
+	int i = 0;
+	u32 reg;
+
+	ports = of_get_child_by_name(dev->of_node, "ports");
+	if (!ports)
+		return -ENODEV;
+
+	for_each_child_of_node(ports, port) {
+		if (of_property_read_u32(port, "reg", &reg))
+			continue;
+
+		if (reg == 0)
+			continue;
+
+		if (i >= ARRAY_SIZE(lt8713sx->next_bridge)) {
+			of_node_put(port);
+			break;
+		}
+
+		ep = of_graph_get_next_endpoint(port, NULL);
+		if (!ep)
+			continue;
+
+		remote = of_graph_get_remote_port_parent(ep);
+		of_node_put(ep);
+
+		if (!remote)
+			continue;
+
+		lt8713sx->next_bridge[i] = of_drm_find_bridge(remote);
+		of_node_put(remote);
+		if (lt8713sx->next_bridge[i])
+			i++;
+	}
+	lt8713sx->num_outputs = i;
+	dev_dbg(dev, "Enabled %d output ports", i);
+
+	of_node_put(ports);
+	return 0;
+};
 
 static int lt8713sx_gpio_init(struct lt8713sx *lt8713sx)
 {
@@ -632,6 +593,10 @@ static const struct attribute_group *lt8713sx_attr_groups[] = {
 	NULL,
 };
 
+static const struct drm_bridge_funcs lt8713sx_bridge_funcs = {
+	.attach = lt8713sx_bridge_attach,
+};
+
 static int lt8713sx_probe(struct i2c_client *client)
 {
 	struct lt8713sx *lt8713sx;
@@ -641,47 +606,51 @@ static int lt8713sx_probe(struct i2c_client *client)
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 		return dev_err_probe(dev, -ENODEV, "device doesn't support I2C\n");
 
-	lt8713sx = devm_kzalloc(dev, sizeof(*lt8713sx), GFP_KERNEL);
-	if (!lt8713sx)
-		return dev_err_probe(dev, -ENOMEM, "failed to allocate lt8713sx struct\n");
+	lt8713sx = devm_drm_bridge_alloc(dev, struct lt8713sx, bridge, &lt8713sx_bridge_funcs);
+	if (IS_ERR(lt8713sx))
+		return PTR_ERR(lt8713sx);
 
 	lt8713sx->dev = dev;
 	lt8713sx->client = client;
 	i2c_set_clientdata(client, lt8713sx);
 
-	mutex_init(&lt8713sx->ocm_lock);
+	ret = devm_mutex_init(lt8713sx->dev, &lt8713sx->ocm_lock);
+	if (ret)
+		return ret;
 
 	lt8713sx->regmap = devm_regmap_init_i2c(client, &lt8713sx_regmap_config);
 	if (IS_ERR(lt8713sx->regmap))
 		return dev_err_probe(dev, PTR_ERR(lt8713sx->regmap), "regmap i2c init failed\n");
 
+	ret = lt8713sx_get_ports(lt8713sx);
+	if (ret < 0)
+		return ret;
+
 	ret = lt8713sx_gpio_init(lt8713sx);
 	if (ret < 0)
-		goto err_of_put;
-
-	ret = lt8713sx_regulator_init(lt8713sx);
-	if (ret < 0)
-		goto err_of_put;
+		return ret;
 
 	ret = lt8713sx_regulator_enable(lt8713sx);
 	if (ret)
-		goto err_of_put;
+		return ret;
 
 	lt8713sx_reset(lt8713sx);
 
-	return 0;
+	lt8713sx->bridge.funcs = &lt8713sx_bridge_funcs;
+	lt8713sx->bridge.of_node = dev->of_node;
+	lt8713sx->bridge.type = DRM_MODE_CONNECTOR_DisplayPort;
+	drm_bridge_add(&lt8713sx->bridge);
 
-err_of_put:
-	return ret;
+	crc8_populate_msb(lt8713sx_crc_table, 0x31);
+
+	return 0;
 }
 
 static void lt8713sx_remove(struct i2c_client *client)
 {
 	struct lt8713sx *lt8713sx = i2c_get_clientdata(client);
 
-	mutex_destroy(&lt8713sx->ocm_lock);
-
-	regulator_bulk_disable(ARRAY_SIZE(lt8713sx->supplies), lt8713sx->supplies);
+	drm_bridge_remove(&lt8713sx->bridge);
 }
 
 static struct i2c_device_id lt8713sx_id[] = {
